@@ -1,63 +1,21 @@
-#!/usr/bin/env python3
-"""Rasterise a PDF to per-page JPEGs for visual QA.
+MIT License
 
-Wraps pdftoppm. Output filenames are <prefix>-1.jpg, <prefix>-2.jpg, etc.
+Copyright (c) 2026 Arbitr
 
-Usage:
-    python qa_pages.py --pdf report.pdf --out qa/ --dpi 150
-"""
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-import argparse
-import shutil
-import subprocess
-import sys
-from pathlib import Path
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pdf", required=True, help="Source PDF")
-    parser.add_argument("--out", default="qa", help="Output directory (default: qa/)")
-    parser.add_argument("--dpi", type=int, default=150, help="Resolution in DPI (default: 150)")
-    parser.add_argument("--prefix", default="page", help="Filename prefix (default: page)")
-    args = parser.parse_args()
-
-    if not shutil.which("pdftoppm"):
-        print(
-            "error: pdftoppm not found. Install with:\n"
-            "  apt-get install -y poppler-utils",
-            file=sys.stderr,
-        )
-        return 2
-
-    pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
-        print(f"error: {pdf_path} not found", file=sys.stderr)
-        return 1
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_prefix = out_dir / args.prefix
-    cmd = [
-        "pdftoppm",
-        "-jpeg",
-        "-r",
-        str(args.dpi),
-        str(pdf_path),
-        str(out_prefix),
-    ]
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
-        print(f"error: pdftoppm exited with {result.returncode}", file=sys.stderr)
-        return result.returncode
-
-    rendered = sorted(out_dir.glob(f"{args.prefix}-*.jpg"))
-    print(f"rendered {len(rendered)} page(s) to {out_dir}/")
-    for p in rendered:
-        print(f"  {p}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
