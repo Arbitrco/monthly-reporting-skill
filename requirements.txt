@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Regression tests for assemble_report.py.
+
+Stdlib unittest only — no extra dependencies. Run from the repo root:
+
+    python -m unittest discover -s tests
+
+These lock the behavioural contract the skill promises: human-authored
+content is HTML-escaped (so < > & render literally and nothing is silently
+dropped), inline sections use stable non-colliding DOM ids, the period
+validator fails cleanly, and logos embed with the correct MIME type.
+"""
+
+import sys
+import unittest
+from pathlib import Path
+
+# Make scripts/ importable when running from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+
+import assemble_report as A  # noqa: E402
+
+
+BRAND = A.load_brand(None)  # neutral defaults
+
+
+class TestEscaping(unittest.TestCase):
+    def test_insights_escaped(self):
+        html = A.build_insights_section(
+            1,
+            [{"kind": "insight", "label": "Margin",
+              "text": "Gross margin <5% on AT&T account"}],
+            logo_box="", brand=BRAND,
+        )
+        self.assertIn("&lt;5%", html)
+        self.assertIn("AT&amp;T", html)
+        self.assertNotIn("<5%", html)
+
+    def test_table_rows_escaped_no_data_loss(self):
+        # The <Northern> qualifier must survive, not be parsed as a tag.
+        html = A.build_table_section(
+            9, "Cross-Team Asks",
+            columns=["Department", "Request", "By When"],
+            widths=[20, 60, 20],
+            rows=[("Sales", "Confirm forecast for <Northern> region & EMEA", "30 May")],
+            empty_text="none", logo_box="", brand=BRAND,
+            dom_id="section-cross-team",
+        )
+        self.assertIn("&lt;Northern&gt; region &amp; EMEA", html)
+
+    def test_decision_structural_entity_not_double_escaped(self):
+        html = A.build_insights_section(
+            1,
+            [{"kind": "decision", "label": "Pricing", "text": "Approve <new> rate"}],
+            logo_box="", brand=BRAND,
+        )
+        self.assertIn("Decision Required &mdash; Pricing", html)  # structural, intact
+        self.assertIn("Approve &lt;new&gt; rate", html)           # user text, escaped
+
+
+class TestDomIds(unittest.TestCase):
+    def test_inline_sections_use_stable_ids(self):
+        ins = A.build_insights_section(1, [], logo_box="", brand=BRAND)
+        self.assertIn('id="section-insights"', ins)
+        tbl = A.build_table_section(
+            9, "Action Items", ["Owner", "Action", "By When"], [15, 65, 20],
+            rows=[], empty_text="none", logo_box="", brand=BRAND,
+            dom_id="section-actions",
+        )
+        self.assertIn('id="section-actions"', tbl)
+        self.assertNotIn('id="section-9"', tbl)
+
+
+class TestPeriod(unittest.TestCase):
+    def test_valid(self):
+        self.assertEqual(A.parse_period("2026-04")[3], "April 2026")
+
+    def test_invalid_month_raises_cleanly(self):
+        with self.assertRaises(SystemExit):
+            A.parse_period("2026-13")
+        with self.assertRaises(SystemExit):
+            A.parse_period("2026-00")
+
+    def test_malformed_raises(self):
+        with self.assertRaises(SystemExit):
+            A.parse_period("April-2026")
+
+
+class TestLogoMime(unittest.TestCase):
+    def _write(self, tmp, name, data=b"x"):
+        p = Path(tmp) / name
+        p.write_bytes(data)
+        return p
+
+    def test_png_and_svg_mime(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._write(tmp, "logo.png")
+            svg = self._write(tmp, "logo.svg", b"<svg/>")
+            self.assertTrue(
+                A.load_logo_data_uri(str(png)).startswith("data:image/png;base64,"))
+            self.assertTrue(
+                A.load_logo_data_uri(str(svg)).startswith("data:image/svg+xml;base64,"))
+
+    def test_missing_logo_is_none(self):
+        self.assertIsNone(A.load_logo_data_uri("/no/such/logo.png"))
+        self.assertIsNone(A.load_logo_data_uri(None))
+
+
+class TestSlug(unittest.TestCase):
+    def test_slugify(self):
+        self.assertEqual(A.slugify_report_title("Monthly Operational Report"),
+                         "monthly-operational-report")
+        self.assertEqual(A.slugify_report_title("Q3 Sales & Marketing Update"),
+                         "q3-sales-marketing-update")
+        self.assertEqual(A.slugify_report_title(""), "report")
+
+
+if __name__ == "__main__":
+    unittest.main()

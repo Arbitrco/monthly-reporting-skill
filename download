@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""Assemble the monthly operational report HTML + PDF for a given period.
+
+Generalised from a production monthly operational report assembler.
+
+Reads:
+    {reports_dir}/{period}-report-inputs.json
+        - period, period_label, issued, data_as_at
+        - insights[]:        {kind:'decision'|'insight', label, text}
+        - cross_team_asks[]: {dept, request, by_when}
+        - action_items[]:    {owner, action, by_when}
+    {reports_dir}/fragments/{period}-section-{N}.html  for each section
+
+Writes:
+    {reports_dir}/{period}-{report-slug}.html
+    {reports_dir}/{period}-{report-slug}.pdf
+    {reports_dir}/{period}-report-actions.json   (carry-forward state for next month)
+
+The report-slug is derived from brand.report.title in your brand.json
+(lowercased, non-alphanumeric collapsed to hyphens). For example, with the
+default title "Monthly Operational Report" the output is
+"2026-04-monthly-operational-report.html". Override with --out-html and
+--out-pdf if you need a different name.
+
+Brand:
+    Pass --brand-json PATH to load colours/fonts/title from a brand config file.
+    If not given, sensible neutral defaults are used.
+    The logo is loaded from brand.company.logo_path if present; otherwise a
+    text-only fallback is rendered in place of the logo box.
+
+Usage:
+    python assemble_report.py --period 2026-04
+    python assemble_report.py --period 2026-04 --brand-json brand.json \\
+        --issued "20 May 2026" --data-as-at "20 May 2026"
+"""
+
+import argparse
+import base64
+import copy
+import html
+import json
+import mimetypes
+import os
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+
+def esc(value):
+    """HTML-escape a user-derived value for safe insertion into the report.
+
+    Applied to everything authored by a human (insights, cross-team asks,
+    action items) and to brand strings (company name, url) so that
+    characters like <, > and & render literally instead of being parsed as
+    markup. Structural entities the assembler emits itself (&mdash;,
+    &middot;) are written outside this call and are never double-escaped.
+    quote=True so the same helper is safe in attribute contexts (alt="...").
+    """
+    return html.escape("" if value is None else str(value))
+
+
+MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+
+# ---------------------------------------------------------------------------
+# Brand defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_BRAND = {
+    "company": {
+        "name": "Your Company",
+        "url": "www.yourcompany.example",
+        "confidentiality_text": "Confidential",
+        "logo_path": None,
+    },
+    "report": {
+        "title": "Monthly Operational Report",
+    },
+    "colours": {
+        "primary":     "#1F3A5F",
+        "secondary":   "#3D6FAB",
+        "accent":      "#4A9DDB",
+        "tertiary":    "#27CED7",
+        "primary_dark": "#15263D",
+        "alert":       "#D85A30",
+        "warning":     "#E67E22",
+        "text":        "#535B62",
+        "text_muted":  "#727C87",
+        "text_subtle": "#9AA2AD",
+        "border":      "#DFE3E5",
+        "bg_page":     "#F4F6F8",
+        "bg_card":     "#FFFFFF",
+    },
+    "typography": {
+        "font_family": "Ruda",
+        "font_fallback": "Calibri, sans-serif",
+        "google_fonts_url":
+            "https://fonts.googleapis.com/css2?family=Ruda:wght@400;500;600;700;800;900&display=swap",
+    },
+}
+
+
+def deep_merge(base, override):
+    """Merge override into base, recursing into dicts."""
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_brand(path):
+    """Load brand.json and merge over defaults. Missing path -> defaults."""
+    brand = copy.deepcopy(DEFAULT_BRAND)
+    if path and Path(path).exists():
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+        brand = deep_merge(DEFAULT_BRAND, loaded)
+    return brand
+
+
+def slugify_report_title(title):
+    """Turn a report title into a filename-safe slug.
+
+    "Monthly Operational Report" -> "monthly-operational-report"
+    "Q3 Sales & Marketing Update" -> "q3-sales-marketing-update"
+    "" -> "report"  (fallback so we never emit an empty filename)
+    """
+    if not title:
+        return "report"
+    s = title.lower()
+    # Replace any run of non-alphanumeric chars with a single hyphen
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    # Strip leading/trailing hyphens
+    s = s.strip("-")
+    return s or "report"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--period", required=True,
+                    help="Reporting period in YYYY-MM form (e.g. 2026-04)")
+    ap.add_argument("--issued", default=None,
+                    help="Issued date string (e.g. '20 May 2026'). Defaults to today.")
+    ap.add_argument("--data-as-at", default=None,
+                    help="Data-as-at date string. Defaults to issued.")
+    ap.add_argument("--brand-json", default=None,
+                    help="Path to brand.json (optional). Falls back to neutral defaults.")
+    ap.add_argument("--reports-dir", default="reports",
+                    help="Reports directory (default: reports/)")
+    ap.add_argument("--fragments-dir", default=None,
+                    help="Fragments directory (default: <reports-dir>/fragments)")
+    ap.add_argument("--inputs", default=None,
+                    help="Inputs JSON path (default: <reports-dir>/<period>-report-inputs.json)")
+    ap.add_argument("--out-html", default=None,
+                    help="Output HTML path")
+    ap.add_argument("--out-pdf", default=None,
+                    help="Output PDF path")
+    ap.add_argument("--out-actions", default=None,
+                    help="Output actions JSON path")
+    ap.add_argument("--empty-cross-team", default=None,
+                    help="Empty-state text for Cross-Team Asks")
+    ap.add_argument("--empty-actions", default=None,
+                    help="Empty-state text for Action Items")
+    return ap.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Period parsing
+# ---------------------------------------------------------------------------
+
+def parse_period(period):
+    m = re.match(r"^(\d{4})-(\d{2})$", period)
+    if not m:
+        raise SystemExit(f"Invalid --period {period!r}; expected YYYY-MM")
+    year, month = int(m.group(1)), int(m.group(2))
+    if not 1 <= month <= 12:
+        raise SystemExit(f"Invalid --period {period!r}; month must be 01-12")
+    period_short = f"{MONTH_NAMES[month][:3]} {year}"
+    period_label = f"{MONTH_NAMES[month]} {year}"
+    return year, month, period_short, period_label
+
+
+# ---------------------------------------------------------------------------
+# Logo helpers
+# ---------------------------------------------------------------------------
+
+def load_logo_data_uri(logo_path):
+    """Return a base64 data URI for the logo with the correct MIME type.
+
+    Derives the media type from the file extension (PNG, JPG, SVG, GIF,
+    WEBP all supported by WeasyPrint) rather than assuming JPEG. Missing
+    path -> None (callers fall back to a text badge).
+    """
+    if not logo_path:
+        return None
+    p = Path(logo_path)
+    if not p.exists():
+        print(f"warning: logo path {logo_path} not found; using text fallback",
+              file=sys.stderr)
+        return None
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime or not mime.startswith("image/"):
+        ext = p.suffix.lower().lstrip(".")
+        mime = {
+            "svg": "image/svg+xml", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+        }.get(ext, "image/png")
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def logo_box_html(logo_uri, company_name, brand):
+    """Right-side logo box for content-page headers."""
+    if logo_uri:
+        return (
+            f'<div class="shl" style="background:#fff;border-radius:4px;'
+            f'padding:4px 8px;height:36px;display:flex;align-items:center">'
+            f'<img src="{logo_uri}" '
+            f'alt="{esc(company_name)}" style="height:26px"></div>'
+        )
+    primary = brand["colours"]["primary"]
+    return (
+        f'<div class="shl" style="background:#fff;border-radius:4px;'
+        f'padding:4px 8px;height:36px;display:flex;align-items:center">'
+        f'<span style="font-weight:800;color:{primary};font-size:9pt">'
+        f'{esc(company_name)}</span></div>'
+    )
+
+
+def cover_logo_img(logo_uri, company_name, brand, height="34px"):
+    """Cover-page logo (no rounded white box — sits on the cover footer bar)."""
+    if logo_uri:
+        return (
+            f'<img src="{logo_uri}" '
+            f'alt="{esc(company_name)}" style="height:{height}">'
+        )
+    primary = brand["colours"]["primary"]
+    return f'<span style="font-weight:800;color:{primary}">{esc(company_name)}</span>'
+
+
+# ---------------------------------------------------------------------------
+# Fragment normaliser
+# ---------------------------------------------------------------------------
+
+_DOCTYPE_RE = re.compile(
+    r'<!DOCTYPE[^>]*>\s*<html[^>]*>.*?<head>(?P<head>.*?)</head>\s*<body[^>]*>(?P<body>.*)</body>\s*</html>',
+    re.S,
+)
+_STYLE_RE = re.compile(r'<style[^>]*>.*?</style>', re.S)
+_SHM_BLOCK_RE = re.compile(
+    r'<div class="shm">\s*<div class="mp">[^<]*</div>\s*<div class="mr">[^<]*</div>\s*</div>',
+    re.S,
+)
+_SHB_PADDING_RE = re.compile(r'(#section-\d+ \.shb\{background:[#A-Fa-f0-9]+;)padding:14px 48px;')
+
+_HEADER_OPENERS = (
+    re.compile(r'<div class="shb">', re.S),
+    re.compile(r'<div class="header-band">', re.S),
+    re.compile(r'<header class="header-band">', re.S),
+)
+
+
+def inject_logo_into_header(html, logo_box):
+    """Insert .shl logo box before the closing tag of the first header bar.
+    Nesting-aware; idempotent if a .shl already exists."""
+    if 'class="shl"' in html:
+        return html
+    for opener in _HEADER_OPENERS:
+        match = opener.search(html)
+        if not match:
+            continue
+        i = match.end()
+        is_header_tag = match.group(0).startswith("<header")
+        close_tag = "</header>" if is_header_tag else "</div>"
+        open_tag  = "<header"   if is_header_tag else "<div"
+        depth = 1
+        n = len(html)
+        while i < n and depth > 0:
+            j_close = html.find(close_tag, i)
+            j_open  = html.find(open_tag, i)
+            if j_close == -1:
+                break
+            if j_open != -1 and j_open < j_close:
+                depth += 1
+                i = j_open + len(open_tag)
+            else:
+                depth -= 1
+                i = j_close + len(close_tag)
+        if depth != 0:
+            return html  # unbalanced, leave alone
+        insert_at = i - len(close_tag)
+        return html[:insert_at].rstrip() + "\n  " + logo_box + "\n" + html[insert_at:]
+    return html
+
+
+def normalise_fragment(html, logo_box):
+    """Make fragments produced by varying section renderers assemble cleanly."""
+    doc = _DOCTYPE_RE.search(html)
+    if doc:
+        head_styles = "\n".join(_STYLE_RE.findall(doc.group("head")))
+        html = (head_styles + "\n" + doc.group("body")) if head_styles else doc.group("body")
+    html = _SHM_BLOCK_RE.sub("", html)
+    html = _SHB_PADDING_RE.sub(r"\1padding:0 48px;height:56px;", html)
+    html = inject_logo_into_header(html, logo_box)
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Inline sections (Key Insights, Cross-Team Asks, Action Items)
+# ---------------------------------------------------------------------------
+
+def page_open(section_n, title, logo_box, brand, dom_id=None):
+    c = brand["colours"]
+    element_id = dom_id or f"section-{section_n}"
+    return (
+        f'<div id="{element_id}" class="page-content" '
+        f'style="font-family:\'{brand["typography"]["font_family"]}\','
+        f'{brand["typography"]["font_fallback"]};background:{c["bg_page"]};'
+        f'width:8.5in;box-sizing:border-box;page-break-before:always">\n'
+        f'  <div class="shb" style="background:{c["primary"]};padding:0 48px;'
+        f'height:56px;display:flex;justify-content:space-between;align-items:center">\n'
+        f'    <h2 style="font-size:13pt;font-weight:800;color:#fff;margin:0;'
+        f'letter-spacing:1px;text-transform:uppercase">{section_n}. {esc(title)}</h2>\n'
+        f'    {logo_box}\n'
+        f'  </div>\n'
+        f'  <div style="padding:28px 48px 36px">\n'
+    )
+
+
+def page_close():
+    return "  </div>\n</div>"
+
+
+def build_insights_section(section_n, insights, logo_box, brand):
+    """Section 1 (or wherever) — Key Insights and Decisions Required."""
+    c = brand["colours"]
+    items = []
+    for ins in insights:
+        kind  = ins.get("kind", "insight")
+        label = esc(ins.get("label", ""))
+        text  = esc(ins.get("text", ""))
+        if kind == "decision":
+            tag    = "Decision Required &mdash; " + label
+            border = c["alert"]
+            bg     = "#FDF3EE"
+            color  = c["alert"]
+        else:
+            tag    = label
+            border = c["accent"]
+            bg     = "#F0F7FC"
+            color  = c["primary"]
+        items.append(
+            f'      <li style="padding:12px 14px;margin-bottom:10px;border-radius:8px;'
+            f'border-left:4px solid {border};background:{bg};font-size:9.5pt;'
+            f'color:{c["text"]};line-height:1.6">'
+            f'<span style="font-weight:800;color:{color};text-transform:uppercase;'
+            f'font-size:8pt;margin-right:6px">{tag}:</span>{text}</li>'
+        )
+    return (
+        page_open(section_n, "Key Insights and Decisions Required", logo_box, brand,
+                  dom_id="section-insights")
+        + '    <ul style="list-style:none;padding:0;margin:0">\n'
+        + "\n".join(items)
+        + "\n    </ul>\n"
+        + page_close()
+    )
+
+
+def build_table_section(section_n, title, columns, widths, rows, empty_text,
+                        logo_box, brand, dom_id=None):
+    c = brand["colours"]
+    headers = "".join(
+        f'<th style="padding:8px 12px;background:{c["primary"]};color:#fff;'
+        f'font-weight:700;text-transform:uppercase;font-size:7pt;text-align:left;'
+        f'width:{w}%">{col}</th>'
+        for col, w in zip(columns, widths)
+    )
+    if not rows:
+        body = (
+            f'    <div style="background:#fff;border-radius:8px;'
+            f'box-shadow:0 2px 8px rgba(0,0,0,.07);padding:24px 28px;text-align:center">'
+            f'<p style="font-size:9.5pt;color:{c["text"]};margin:0;line-height:1.5">'
+            f'{empty_text}</p></div>'
+        )
+    else:
+        tr_html = []
+        for i, r in enumerate(rows):
+            bg = c["bg_page"] if i % 2 == 0 else "#fff"
+            tds = "".join(
+                f'<td style="padding:8px 12px;'
+                f'color:{(c["primary"] + ";font-weight:700") if k == 0 else c["text"]};'
+                f'border-bottom:1px solid {c["border"]}">{esc(v)}</td>'
+                for k, v in enumerate(r)
+            )
+            tr_html.append(f'<tr style="background:{bg}">{tds}</tr>')
+        body = (
+            '    <div style="background:#fff;border-radius:8px;'
+            'box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden">'
+            '<table style="width:100%;border-collapse:collapse;font-size:8pt">'
+            f'<thead><tr>{headers}</tr></thead>'
+            f'<tbody>{"".join(tr_html)}</tbody>'
+            '</table></div>'
+        )
+    return page_open(section_n, title, logo_box, brand, dom_id=dom_id) + body + "\n" + page_close()
+
+
+# ---------------------------------------------------------------------------
+# Cover page
+# ---------------------------------------------------------------------------
+
+def build_cover(brand, period_label, issued, data_as_at, logo_uri):
+    c = brand["colours"]
+    primary       = c["primary"]
+    primary_dark  = c.get("primary_dark", primary)
+    secondary     = c["secondary"]
+    accent        = c["accent"]
+    tertiary      = c.get("tertiary", accent)
+    text_subtle   = c["text_subtle"]
+    border        = c["border"]
+    ff            = brand["typography"]["font_family"]
+    ffb           = brand["typography"]["font_fallback"]
+    company_name  = esc(brand["company"]["name"])
+    url           = esc(brand["company"]["url"])
+    period_label  = esc(period_label)
+    issued        = esc(issued)
+    data_as_at    = esc(data_as_at)
+    # Escape first, then turn spaces into line breaks (so an & in the title
+    # becomes &amp; rather than the <br> being escaped away).
+    report_title  = esc(brand["report"]["title"]).replace(" ", "<br>")
+
+    cover_logo = cover_logo_img(logo_uri, brand["company"]["name"], brand, height="34px")
+
+    return f"""<div id="cover" style="font-family:'{ff}',{ffb};background:{primary};width:8.5in;height:11in;box-sizing:border-box;position:relative;overflow:hidden;page-break-after:always">
+  <div style="position:absolute;width:3.4in;height:3.4in;background:{secondary};opacity:0.22;top:-0.9in;right:-0.9in;transform:rotate(20deg);border-radius:8px"></div>
+  <div style="position:absolute;width:2.1in;height:2.1in;background:{accent};opacity:0.16;top:0.6in;right:1.1in;transform:rotate(10deg);border-radius:8px"></div>
+  <div style="position:absolute;width:1.1in;height:1.1in;background:{tertiary};opacity:0.14;bottom:2.6in;right:0.5in;transform:rotate(-15deg);border-radius:8px"></div>
+  <div style="position:absolute;width:4.2in;height:4.2in;background:{primary_dark};opacity:0.55;bottom:-1.6in;right:-1.1in;transform:rotate(15deg);border-radius:8px"></div>
+  <div style="position:relative;z-index:2;padding:60px 52px 0">
+    <div style="font-size:8pt;font-weight:800;color:{accent};text-transform:uppercase;letter-spacing:2px;margin-bottom:18px">{company_name}</div>
+    <div style="font-size:36pt;font-weight:800;color:#fff;text-transform:uppercase;line-height:1.1;margin:0 0 14px">{report_title}</div>
+    <div style="font-size:11pt;color:{text_subtle};margin:0 0 40px">{period_label}</div>
+    <div style="display:flex;gap:40px">
+      <div><div style="font-size:7.5pt;font-weight:800;color:{accent};text-transform:uppercase;letter-spacing:1px">Period</div><span style="font-size:10pt;font-weight:600;color:{border}">{period_label}</span></div>
+      <div><div style="font-size:7.5pt;font-weight:800;color:{accent};text-transform:uppercase;letter-spacing:1px">Issued</div><span style="font-size:10pt;font-weight:600;color:{border}">{issued}</span></div>
+      <div><div style="font-size:7.5pt;font-weight:800;color:{accent};text-transform:uppercase;letter-spacing:1px">Data as at</div><span style="font-size:10pt;font-weight:600;color:{border}">{data_as_at}</span></div>
+    </div>
+  </div>
+  <div style="position:absolute;bottom:0;left:0;right:0;height:0.72in;background:#fff;border-top:3px solid {accent};display:flex;align-items:center;justify-content:space-between;padding:0 52px">
+    {cover_logo}
+    <span style="font-size:7.5pt;font-weight:800;color:{secondary}">{url}</span>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Outer document and brand CSS
+# ---------------------------------------------------------------------------
+
+def build_brand_css(brand):
+    c = brand["colours"]
+    return f"""
+/* Cover page: full bleed, no running header, no global footer */
+@page {{ size: letter; margin: 0; }}
+/* Content pages: reserve top space for the running section header
+   and bottom space for the global footer. */
+@page content-page {{
+  size: letter;
+  margin: 0.78in 0 0.50in 0;
+  @top-center {{
+    content: element(section-header);
+    width: 8.5in;
+    height: 0.78in;
+    padding: 0;
+  }}
+}}
+.page-content, [id^="section-"] {{ page: content-page; }}
+
+/* Running section header: every .shb is hoisted out of normal flow into
+   the @top-center margin box, so headers repeat on multi-page sections. */
+.shb {{ position: running(section-header); }}
+
+* {{ box-sizing: border-box; }}
+body {{ font-family: '{brand["typography"]["font_family"]}',{brand["typography"]["font_fallback"]}; background: {c["bg_page"]}; margin: 0; padding: 0; }}
+
+/* Global footer — fixed position offset into the reserved page margin */
+#global-footer {{
+  position: fixed;
+  bottom: -0.50in;
+  left: 0;
+  right: 0;
+  height: 0.50in;
+  background: {c["primary"]};
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 40px;
+  z-index: 100;
+}}
+#global-footer .gf-left  {{ font-size: 7pt; color: {c["text_subtle"]}; }}
+#global-footer .gf-right {{ font-size: 7pt; font-weight: 800; color: {c["accent"]}; }}
+
+/* Pagination control: keep visual blocks intact, allow tables to break by row */
+.chart-card, .chart-wrap, .kpi-grid, .kpi, .ks,
+.callout, .cmtb, .sn, .vtw, svg {{
+  break-inside: avoid;
+  page-break-inside: avoid;
+}}
+thead {{ display: table-header-group; }}
+tr {{ break-inside: avoid; page-break-inside: avoid; }}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Carry-forward actions JSON
+# ---------------------------------------------------------------------------
+
+def build_actions_json(period_label, cross_team, actions):
+    today = date.today().strftime("%Y-%m-%d")
+    return {
+        "period":          period_label,
+        "generated":       today,
+        "cross_team_asks": [
+            {"dept":    a.get("dept", ""),
+             "request": a.get("request", ""),
+             "by_when": a.get("by_when", ""),
+             "status":  "open"}
+            for a in cross_team
+        ],
+        "action_items": [
+            {"owner":   a.get("owner", ""),
+             "action":  a.get("action", ""),
+             "by_when": a.get("by_when", ""),
+             "status":  "open"}
+            for a in actions
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+DEFAULT_EMPTY_CROSS_TEAM = (
+    "No cross-team asks have been raised this month. "
+    "Outstanding items from prior reports remain in their respective owners' workstreams."
+)
+DEFAULT_EMPTY_ACTIONS = (
+    "No new action items have been raised from this month's results. "
+    "Decisions flagged in the insights section carry their own owners; "
+    "standing operational tasks remain in the team trackers."
+)
+
+
+def main():
+    args = parse_args()
+
+    year, month, period_short, period_label = parse_period(args.period)
+    today = date.today()
+    issued_default = today.strftime("%d %B %Y").lstrip("0")
+
+    # Brand — loaded early so the report-title slug can drive default output filenames
+    brand = load_brand(args.brand_json)
+    logo_uri = load_logo_data_uri(brand["company"].get("logo_path"))
+    logo_box = logo_box_html(logo_uri, brand["company"]["name"], brand)
+    report_slug = slugify_report_title(brand["report"].get("title", ""))
+
+    # Resolve paths
+    reports_dir   = Path(args.reports_dir)
+    fragments_dir = Path(args.fragments_dir) if args.fragments_dir else reports_dir / "fragments"
+    inputs_path   = Path(args.inputs) if args.inputs else reports_dir / f"{args.period}-report-inputs.json"
+    out_html      = Path(args.out_html) if args.out_html else reports_dir / f"{args.period}-{report_slug}.html"
+    out_pdf       = Path(args.out_pdf) if args.out_pdf else reports_dir / f"{args.period}-{report_slug}.pdf"
+    out_actions   = Path(args.out_actions) if args.out_actions else reports_dir / f"{args.period}-report-actions.json"
+
+    # Inputs JSON
+    if not inputs_path.exists():
+        raise SystemExit(
+            f"Inputs file not found: {inputs_path}\n"
+            f"Create one with the schema:\n"
+            f'{{"period":"{args.period}","period_label":"{period_label}",'
+            f'"issued":"...","data_as_at":"...",'
+            f'"insights":[...],"cross_team_asks":[...],"action_items":[...]}}'
+        )
+    inputs = json.loads(inputs_path.read_text(encoding="utf-8"))
+    period_label  = inputs.get("period_label", period_label)
+    issued        = args.issued     or inputs.get("issued")     or issued_default
+    data_as_at    = args.data_as_at or inputs.get("data_as_at") or issued
+    insights      = inputs.get("insights", [])
+    cross_team    = inputs.get("cross_team_asks", [])
+    actions       = inputs.get("action_items", [])
+
+    empty_cross_team = args.empty_cross_team or DEFAULT_EMPTY_CROSS_TEAM
+    empty_actions    = args.empty_actions    or DEFAULT_EMPTY_ACTIONS
+
+    # Discover section fragments by globbing fragments_dir
+    fragment_pattern = re.compile(rf"^{re.escape(args.period)}-section-(\d+)\.html$")
+    fragment_paths = sorted(
+        (p for p in fragments_dir.glob(f"{args.period}-section-*.html")
+         if fragment_pattern.match(p.name)),
+        key=lambda p: int(fragment_pattern.match(p.name).group(1)),
+    )
+    if not fragment_paths:
+        print(f"warning: no fragment files found in {fragments_dir}",
+              file=sys.stderr)
+    fragment_numbers = [int(fragment_pattern.match(p.name).group(1))
+                        for p in fragment_paths]
+
+    # Section 1 is reserved for the Key Insights front section. A data section
+    # numbered 1 would render a second "1." heading; warn rather than silently
+    # produce a confusing report. (DOM ids no longer collide — the inline
+    # sections use stable string ids — but the visible numbering still would.)
+    if 1 in fragment_numbers:
+        print("warning: a data section is numbered 1, which is reserved for "
+              "Key Insights. Renumber it (data sections should start at 2) to "
+              "avoid two '1.' headings.", file=sys.stderr)
+
+    # Build fragment HTML blocks
+    fragment_blocks = []
+    for n, p in zip(fragment_numbers, fragment_paths):
+        content = p.read_text(encoding="utf-8")
+        normalised = normalise_fragment(content, logo_box)
+        fragment_blocks.append(
+            f'<div class="page-content" style="page-break-before:always">\n'
+            f'{normalised}\n</div>'
+        )
+
+    # Section numbering for inline sections
+    # Insights = 1, Cross-Team Asks = max_fragment_n + 1, Action Items = +2
+    insights_n = 1
+    if fragment_numbers:
+        next_after_fragments = max(fragment_numbers) + 1
+    else:
+        next_after_fragments = 9
+    cross_team_n = next_after_fragments
+    actions_n    = next_after_fragments + 1
+
+    # Build inline sections
+    insights_html = build_insights_section(insights_n, insights, logo_box, brand)
+    cross_team_rows = [(a.get("dept", ""), a.get("request", ""), a.get("by_when", ""))
+                       for a in cross_team]
+    cross_team_html = build_table_section(
+        cross_team_n, "Cross-Team Asks",
+        columns=["Department", "Request", "By When"],
+        widths=[20, 60, 20],
+        rows=cross_team_rows,
+        empty_text=empty_cross_team,
+        logo_box=logo_box, brand=brand, dom_id="section-cross-team",
+    )
+    actions_rows = [(a.get("owner", ""), a.get("action", ""), a.get("by_when", ""))
+                    for a in actions]
+    actions_html = build_table_section(
+        actions_n, "Action Items",
+        columns=["Owner", "Action", "By When"],
+        widths=[15, 65, 20],
+        rows=actions_rows,
+        empty_text=empty_actions,
+        logo_box=logo_box, brand=brand, dom_id="section-actions",
+    )
+
+    # Cover
+    cover_html = build_cover(brand, period_label, issued, data_as_at, logo_uri)
+
+    # Outer document
+    brand_css = build_brand_css(brand)
+    conf_text = brand["company"].get("confidentiality_text")
+    if conf_text:
+        confidentiality = esc(conf_text)
+    else:
+        confidentiality = (
+            f'Confidential &middot; {esc(brand["company"]["name"])} &middot; {year}'
+        )
+
+    doc_title = f'{esc(brand["report"]["title"].upper())} &mdash; {esc(period_label.upper())}'
+    full_html = (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="UTF-8">\n'
+        f'<title>{doc_title}</title>\n'
+        f'<link href="{esc(brand["typography"].get("google_fonts_url",""))}" rel="stylesheet">\n'
+        f'<style>{brand_css}</style>\n'
+        '</head>\n<body>\n'
+        + cover_html + "\n"
+        + insights_html + "\n"
+        + "\n".join(fragment_blocks) + ("\n" if fragment_blocks else "")
+        + cross_team_html + "\n"
+        + actions_html + "\n"
+        + f'<div id="global-footer">\n'
+        f'  <span class="gf-left">{confidentiality}</span>\n'
+        f'  <span class="gf-right">{esc(brand["company"]["url"])}</span>\n'
+        f'</div>\n'
+        '</body>\n</html>'
+    )
+
+    out_html.parent.mkdir(parents=True, exist_ok=True)
+    out_html.write_text(full_html, encoding="utf-8")
+    print(f"HTML saved: {out_html} ({len(full_html):,} chars)")
+
+    # Carry-forward actions JSON
+    actions_data = build_actions_json(period_label, cross_team, actions)
+    out_actions.parent.mkdir(parents=True, exist_ok=True)
+    out_actions.write_text(
+        json.dumps(actions_data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Actions JSON saved: {out_actions}")
+
+    # PDF
+    try:
+        from weasyprint import HTML as WPH  # type: ignore
+        WPH(filename=str(out_html), base_url=str(out_html.parent)).write_pdf(str(out_pdf))
+        print(f"PDF saved: {out_pdf} ({os.path.getsize(out_pdf):,} bytes)")
+    except ImportError:
+        print("WeasyPrint not installed — HTML only. Install with:\n"
+              "  pip install -r requirements.txt", file=sys.stderr)
+    except Exception as e:
+        print(f"WeasyPrint error: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
